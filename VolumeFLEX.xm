@@ -7,6 +7,7 @@
 static NSString *gFlexDylibPath = nil;
 static NSHashTable *gVFWindowsWithGestures = nil;
 static char kVFLongPressCopyGestureKey;
+static char kVFExportActionAddedKey;
 
 #define kVFStatusBarLongPressGesture 0xdeadbabe
 
@@ -29,6 +30,11 @@ static char kVFLongPressCopyGestureKey;
 @interface UITableViewCell (VolumeFLEXCopy)
 - (void)vf_installLongPressCopyGestureIfNeeded;
 - (void)vf_copyFLEXText:(UILongPressGestureRecognizer *)gesture;
+@end
+
+@interface FLEXObjectExplorerViewController : UIViewController
+@property (nonatomic, readonly) id object;
+@property (nonatomic, readonly) id explorer;
 @end
 
 static BOOL VFClassNameIsFLEX(Class cls) {
@@ -73,6 +79,167 @@ static void VFShowExplorer(void) {
     [[objc_getClass("FLEXManager") sharedManager] showExplorer];
 }
 
+static UIViewController *VFTopViewControllerFrom(UIViewController *controller) {
+    while (controller.presentedViewController) {
+        controller = controller.presentedViewController;
+    }
+
+    if ([controller isKindOfClass:UINavigationController.class]) {
+        return VFTopViewControllerFrom([(UINavigationController *)controller topViewController]);
+    }
+
+    if ([controller isKindOfClass:UITabBarController.class]) {
+        return VFTopViewControllerFrom([(UITabBarController *)controller selectedViewController]);
+    }
+
+    return controller;
+}
+
+static UIViewController *VFTopViewController(void) {
+    UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+    if (!keyWindow) {
+        for (UIWindow *window in UIApplication.sharedApplication.windows) {
+            if (window.isKeyWindow) {
+                keyWindow = window;
+                break;
+            }
+        }
+    }
+
+    return VFTopViewControllerFrom(keyWindow.rootViewController);
+}
+
+static UIViewController *VFObjectExplorerViewControllerForAlert(UIAlertController *alert) {
+    UIViewController *controller = alert.presentingViewController ?: VFTopViewController();
+    while (controller) {
+        if ([NSStringFromClass(controller.class) isEqualToString:@"FLEXObjectExplorerViewController"]) {
+            return controller;
+        }
+
+        if ([controller isKindOfClass:UINavigationController.class]) {
+            UIViewController *top = [(UINavigationController *)controller topViewController];
+            if ([NSStringFromClass(top.class) isEqualToString:@"FLEXObjectExplorerViewController"]) {
+                return top;
+            }
+        }
+
+        controller = controller.presentingViewController;
+    }
+
+    return nil;
+}
+
+static NSString *VFSafeString(id value) {
+    if (!value || value == NSNull.null) {
+        return @"";
+    }
+
+    @try {
+        return [value description] ?: @"";
+    } @catch (__unused NSException *exception) {
+        return @"<description unavailable>";
+    }
+}
+
+static id VFCall(id target, SEL selector) {
+    if (!target || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    return [target performSelector:selector];
+#pragma clang diagnostic pop
+}
+
+static void VFAppendMetadataItems(NSMutableString *output, NSString *title, NSArray *items) {
+    [output appendFormat:@"\n## %@ (%lu)\n", title, (unsigned long)items.count];
+
+    if (items.count == 0) {
+        [output appendString:@"(none)\n"];
+        return;
+    }
+
+    for (id item in items) {
+        NSString *name = VFSafeString(VFCall(item, @selector(name)) ?: VFCall(item, @selector(selectorString)));
+        NSString *detail = VFSafeString(
+            VFCall(item, @selector(fullDescription)) ?:
+            VFCall(item, @selector(details)) ?:
+            VFCall(item, @selector(description))
+        );
+
+        if (name.length > 0 && detail.length > 0 && ![detail isEqualToString:name]) {
+            [output appendFormat:@"%@\n  %@\n", name, detail];
+        } else if (detail.length > 0) {
+            [output appendFormat:@"%@\n", detail];
+        } else if (name.length > 0) {
+            [output appendFormat:@"%@\n", name];
+        }
+    }
+}
+
+static NSString *VFSafeFileName(NSString *name) {
+    NSMutableCharacterSet *invalid = [NSMutableCharacterSet characterSetWithCharactersInString:@"/:\\?%*|\"<>"];
+    [invalid formUnionWithCharacterSet:NSCharacterSet.newlineCharacterSet];
+    NSArray *parts = [name componentsSeparatedByCharactersInSet:invalid];
+    NSString *safe = [parts componentsJoinedByString:@"_"];
+    return safe.length > 0 ? safe : @"FLEXObject";
+}
+
+static NSString *VFExportCurrentClassInfo(UIViewController *controller, NSError **error) {
+    id explorer = VFCall(controller, @selector(explorer));
+    if (!explorer) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find FLEX explorer for current screen."}];
+        }
+        return nil;
+    }
+
+    id object = VFCall(explorer, @selector(object)) ?: VFCall(controller, @selector(object));
+    NSString *objectName = NSStringFromClass(object_getClass(object));
+    if (object && object == object_getClass(object)) {
+        objectName = NSStringFromClass((Class)object);
+    }
+
+    NSMutableString *output = [NSMutableString string];
+    [output appendFormat:@"FLEX Class Export\n"];
+    [output appendFormat:@"Object: %@\n", VFSafeString(object)];
+    [output appendFormat:@"Class: %@\n", objectName ?: @"(unknown)"];
+    [output appendFormat:@"Exported At: %@\n", NSDate.date];
+
+    NSString *objectDescription = VFSafeString(VFCall(explorer, @selector(objectDescription)));
+    if (objectDescription.length > 0) {
+        [output appendFormat:@"\n## Description\n%@\n", objectDescription];
+    }
+
+    VFAppendMetadataItems(output, @"Properties", VFCall(explorer, @selector(properties)) ?: @[]);
+    VFAppendMetadataItems(output, @"Class Properties", VFCall(explorer, @selector(classProperties)) ?: @[]);
+    VFAppendMetadataItems(output, @"Ivars", VFCall(explorer, @selector(ivars)) ?: @[]);
+    VFAppendMetadataItems(output, @"Methods", VFCall(explorer, @selector(methods)) ?: @[]);
+    VFAppendMetadataItems(output, @"Class Methods", VFCall(explorer, @selector(classMethods)) ?: @[]);
+    VFAppendMetadataItems(output, @"Protocols", VFCall(explorer, @selector(conformedProtocols)) ?: @[]);
+    VFAppendMetadataItems(output, @"Class Hierarchy", VFCall(explorer, @selector(classHierarchy)) ?: @[]);
+
+    NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VolumeFLEXExports"];
+    [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *fileName = [NSString stringWithFormat:@"%@-%@.txt", VFSafeFileName(objectName), @((long long)(NSDate.date.timeIntervalSince1970))];
+    NSString *path = [directory stringByAppendingPathComponent:fileName];
+    if (![output writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error]) {
+        return nil;
+    }
+
+    UIPasteboard.generalPasteboard.string = path;
+    return path;
+}
+
+static void VFShowExportResult(UIViewController *presenter, NSString *path, NSError *error) {
+    NSString *title = path ? @"Exported TXT" : @"Export Failed";
+    NSString *message = path ? [NSString stringWithFormat:@"Saved to:\n%@\n\nPath copied to pasteboard.", path] : error.localizedDescription;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
 
 %group SpringBoardStatusBarHooks
 
@@ -153,6 +320,51 @@ static void VFShowExplorer(void) {
 
 %end
 
+
+%group ExportHooks
+
+%hook UIAlertController
+
+- (void)addAction:(UIAlertAction *)action {
+    %orig;
+
+    if (objc_getAssociatedObject(self, &kVFExportActionAddedKey)) {
+        return;
+    }
+
+    if (![action.title isEqualToString:@"Copy Address"]) {
+        return;
+    }
+
+    BOOL hasBookmarkAction = NO;
+    BOOL hasCopyDescriptionAction = NO;
+    for (UIAlertAction *existingAction in self.actions) {
+        hasBookmarkAction = hasBookmarkAction || [existingAction.title isEqualToString:@"Add to Bookmarks"];
+        hasCopyDescriptionAction = hasCopyDescriptionAction || [existingAction.title isEqualToString:@"Copy Description"];
+    }
+
+    if (!hasBookmarkAction || !hasCopyDescriptionAction) {
+        return;
+    }
+
+    __weak UIAlertController *weakAlert = self;
+    UIAlertAction *exportAction = [UIAlertAction actionWithTitle:@"Export Class Info TXT" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *selectedAction) {
+        UIAlertController *alert = weakAlert;
+        UIViewController *explorerController = VFObjectExplorerViewControllerForAlert(alert);
+        UIViewController *presenter = explorerController ?: VFTopViewController();
+        NSError *error = nil;
+        NSString *path = VFExportCurrentClassInfo(explorerController, &error);
+        VFShowExportResult(presenter, path, error);
+    }];
+
+    objc_setAssociatedObject(self, &kVFExportActionAddedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self addAction:exportAction];
+}
+
+%end
+
+%end
+
 %group CopyHooks
 
 %hook UITableViewCell
@@ -223,6 +435,7 @@ static void VFShowExplorer(void) {
 
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     %init(CopyHooks);
+    %init(ExportHooks);
 
     if (bid.length > 0) {
         %init(ActivationGestureHooks);
