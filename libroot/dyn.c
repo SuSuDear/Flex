@@ -1,16 +1,22 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <sys/param.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <libroot.h>
+#include <unistd.h>
 
 #if THEOS_PACKAGE_SCHEME_ROOTHIDE
 #include <roothide.h>
 #endif
+
+const char *libroot_dyn_get_root_prefix(void);
+const char *libroot_dyn_get_jbroot_prefix(void);
+const char *libroot_dyn_get_boot_uuid(void);
+char *libroot_dyn_rootfspath(const char *path, char *resolvedPath);
+char *libroot_dyn_jbrootpath(const char *path, char *resolvedPath);
 
 static const char *(*dyn_get_root_prefix)(void) = NULL;
 static const char *(*dyn_get_jbroot_prefix)(void) = NULL;
