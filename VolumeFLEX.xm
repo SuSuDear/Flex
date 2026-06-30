@@ -674,6 +674,114 @@ static void VFAppendObjectProperties(NSMutableString *output, id object, NSUInte
     free(properties);
 }
 
+static NSArray<NSString *> *VFFilterKVCKeys(void) {
+    return @[
+        @"name", @"type", @"enabled", @"inputRadius", @"inputAmount", @"inputNormalizeEdges",
+        @"inputHardEdges", @"inputQuality", @"inputScale", @"inputBias", @"inputColor",
+        @"inputColor0", @"inputColor1", @"inputColorMatrix", @"inputLevels", @"inputOpacity",
+        @"inputBrightness", @"inputContrast", @"inputSaturation", @"inputCenter",
+        @"inputExtent", @"inputSize", @"inputTransform", @"inputMaskImage", @"inputImage"
+    ];
+}
+
+static void VFAppendFilterObjectDetail(NSMutableString *output, id filter, NSString *label) {
+    [output appendFormat:@"\n%@\n", label];
+    if (!filter) {
+        [output appendString:@"(none)\n"];
+        return;
+    }
+
+    [output appendFormat:@"class: %@\n", NSStringFromClass([filter class])];
+    [output appendFormat:@"address: %p\n", filter];
+    [output appendFormat:@"description: %@\n", VFSafeString(filter)];
+
+    BOOL hasKVCValue = NO;
+    [output appendString:@"kvc:\n"];
+    for (NSString *key in VFFilterKVCKeys()) {
+        id value = VFKVCValue(filter, key);
+        if (value) {
+            hasKVCValue = YES;
+            [output appendFormat:@"  %@: %@\n", key, VFSafeString(value)];
+        }
+    }
+    if (!hasKVCValue) {
+        [output appendString:@"  (none)\n"];
+    }
+
+    unsigned int propertyCount = 0;
+    objc_property_t *properties = class_copyPropertyList(object_getClass(filter), &propertyCount);
+    [output appendFormat:@"runtimeProperties: %u\n", propertyCount];
+    unsigned int cappedPropertyCount = (unsigned int)MIN((NSUInteger)propertyCount, (NSUInteger)40);
+    for (unsigned int index = 0; index < cappedPropertyCount; index++) {
+        objc_property_t property = properties[index];
+        NSString *name = VFCStringToString(property_getName(property));
+        NSString *attributes = VFCStringToString(property_getAttributes(property));
+        NSString *value = VFValueForProperty(filter, property);
+        [output appendFormat:@"  - %@\n", name.length ? name : @"(unknown)"];
+        if (attributes.length > 0) {
+            [output appendFormat:@"    attributes: %@\n", attributes];
+        }
+        if (value.length > 0) {
+            [output appendFormat:@"    value: %@\n", value];
+        }
+    }
+    if (propertyCount > cappedPropertyCount) {
+        [output appendFormat:@"  ... truncated %u properties\n", propertyCount - cappedPropertyCount];
+    }
+    free(properties);
+
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(filter), &ivarCount);
+    [output appendFormat:@"runtimeIvars: %u\n", ivarCount];
+    unsigned int cappedIvarCount = (unsigned int)MIN((NSUInteger)ivarCount, (NSUInteger)40);
+    for (unsigned int index = 0; index < cappedIvarCount; index++) {
+        Ivar ivar = ivars[index];
+        NSString *name = VFCStringToString(ivar_getName(ivar));
+        NSString *encoding = VFCStringToString(ivar_getTypeEncoding(ivar));
+        NSString *value = VFValueForIvar(filter, ivar);
+        [output appendFormat:@"  - %@\n    encoding: %@\n    offset: %td\n", name.length ? name : @"(unknown)", encoding, ivar_getOffset(ivar)];
+        if (value.length > 0) {
+            [output appendFormat:@"    value: %@\n", value];
+        }
+    }
+    if (ivarCount > cappedIvarCount) {
+        [output appendFormat:@"  ... truncated %u ivars\n", ivarCount - cappedIvarCount];
+    }
+    free(ivars);
+}
+
+static void VFAppendFilterListDetail(NSMutableString *output, id filters, NSString *title) {
+    [output appendFormat:@"\n### %@ Detail\n", title];
+    if (!filters) {
+        [output appendString:@"(none)\n"];
+        return;
+    }
+
+    if ([filters isKindOfClass:NSArray.class]) {
+        NSArray *filterArray = (NSArray *)filters;
+        if (filterArray.count == 0) {
+            [output appendString:@"(empty)\n"];
+            return;
+        }
+
+        NSUInteger index = 0;
+        for (id filter in filterArray) {
+            VFAppendFilterObjectDetail(output, filter, [NSString stringWithFormat:@"[%lu]", (unsigned long)index]);
+            index++;
+        }
+        return;
+    }
+
+    VFAppendFilterObjectDetail(output, filters, @"[object]");
+}
+
+static void VFAppendLayerFiltersDetail(NSMutableString *output, CALayer *layer) {
+    [output appendString:@"\n## Layer Filters Detail\n"];
+    VFAppendFilterListDetail(output, layer.filters, @"filters");
+    VFAppendFilterListDetail(output, layer.backgroundFilters, @"backgroundFilters");
+    VFAppendFilterListDetail(output, layer.compositingFilter, @"compositingFilter");
+}
+
 static void VFAppendLayerSnapshot(NSMutableString *output, CALayer *layer) {
     if (!layer) {
         return;
@@ -698,6 +806,7 @@ static void VFAppendLayerSnapshot(NSMutableString *output, CALayer *layer) {
     VFAppendLine(output, @"filters", layer.filters);
     VFAppendLine(output, @"backgroundFilters", layer.backgroundFilters);
     [output appendFormat:@"sublayersCount: %lu\n", (unsigned long)layer.sublayers.count];
+    VFAppendLayerFiltersDetail(output, layer);
 }
 
 static void VFAppendViewSnapshot(NSMutableString *output, UIView *view) {
