@@ -1,24 +1,29 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
-#import <notify.h>
 #import <objc/runtime.h>
 #import <rootless.h>
 
 static NSString *gFlexDylibPath = nil;
+static NSHashTable *gVFWindowsWithGestures = nil;
 static char kVFLongPressCopyGestureKey;
+
+#define kVFStatusBarLongPressGesture 0xdeadbabe
 
 @interface FLEXManager : NSObject
 + (instancetype)sharedManager;
 - (void)showExplorer;
 @end
 
-@interface SBApplication
-- (NSString *)bundleIdentifier;
+@interface UIStatusBarWindow : UIWindow
 @end
 
-@interface SpringBoard
-- (SBApplication *)_accessibilityFrontMostApplication;
+@interface UIStatusBarTapAction : NSObject
+@property (nonatomic, readonly) NSInteger type;
+@end
+
+@interface SBMainDisplaySceneLayoutStatusBarView : UIView
+- (void)_statusBarTapped:(id)sender type:(NSInteger)type;
 @end
 
 @interface UITableViewCell (VolumeFLEXCopy)
@@ -63,45 +68,85 @@ static UILabel *VFLabelFromView(UIView *view) {
     return nil;
 }
 
-%group SpringBoardHooks
+static void VFShowExplorer(void) {
+    dlopen(gFlexDylibPath.UTF8String, RTLD_NOW);
+    [[objc_getClass("FLEXManager") sharedManager] showExplorer];
+}
 
-%hook SpringBoard
 
-- (BOOL)_handlePhysicalButtonEvent:(UIPressesEvent *)event {
-    BOOL upPressed = NO;
-    BOOL downPressed = NO;
+%group SpringBoardStatusBarHooks
 
-    for (UIPress *press in event.allPresses.allObjects) {
-        if (press.type == 102 && press.force == 1) {
-            upPressed = YES;
-        }
-        if (press.type == 103 && press.force == 1) {
-            downPressed = YES;
-        }
-#if TARGET_IPHONE_SIMULATOR
-        if (press.type == 2227 && press.force == 1) {
-            upPressed = YES;
-        }
-        if (press.type == 2231 && press.force == 1) {
-            downPressed = YES;
-        }
-#endif
+%hook SBMainDisplaySceneLayoutStatusBarView
+
+- (void)_addStatusBarIfNeeded {
+    %orig;
+
+    UIView *statusBar = [self valueForKey:@"_statusBar"];
+    [statusBar addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(vf_statusBarLongPressed:)]];
+}
+
+%new
+- (void)vf_statusBarLongPressed:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        [self _statusBarTapped:recognizer type:kVFStatusBarLongPressGesture];
+    }
+}
+
+%end
+
+%end
+
+%group ActivationGestureHooks
+
+%hook UIStatusBarManager
+
+- (void)handleTapAction:(UIStatusBarTapAction *)action {
+    if (action.type == kVFStatusBarLongPressGesture) {
+        VFShowExplorer();
+    } else {
+        %orig(action);
+    }
+}
+
+%end
+
+%hook UIWindow
+
+%new
+- (void)vf_showExplorerFromGesture:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        VFShowExplorer();
+    }
+}
+
+- (void)becomeKeyWindow {
+    %orig;
+
+    if (!gVFWindowsWithGestures) {
+        gVFWindowsWithGestures = [NSHashTable weakObjectsHashTable];
     }
 
-    if (upPressed && downPressed) {
-        SBApplication *frontMostApp =
-            [(SpringBoard *)UIApplication.sharedApplication _accessibilityFrontMostApplication];
+    BOOL needsGesture = ![gVFWindowsWithGestures containsObject:self];
+    BOOL isFLEXWindow = VFClassNameIsFLEX(self.class);
+    BOOL isStatusBar = [self isKindOfClass:[UIStatusBarWindow class]];
+    if (needsGesture && !isFLEXWindow && !isStatusBar) {
+        [gVFWindowsWithGestures addObject:self];
 
-        if (frontMostApp) {
-            notify_post(
-                [[NSString stringWithFormat:@"com.joshua.volumeflex/%@", frontMostApp.bundleIdentifier] UTF8String]);
-        } else {
-            dlopen([gFlexDylibPath UTF8String], RTLD_NOW);
-            [[objc_getClass("FLEXManager") sharedManager] showExplorer];
-        }
+        UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(vf_showExplorerFromGesture:)];
+        gesture.minimumPressDuration = 0.5;
+        gesture.numberOfTouchesRequired = 3;
+        [self addGestureRecognizer:gesture];
     }
+}
 
-    return %orig;
+%end
+
+%hook UIStatusBarWindow
+
+- (id)initWithFrame:(CGRect)frame {
+    self = %orig;
+    [self addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(vf_showExplorerFromGesture:)]];
+    return self;
 }
 
 %end
@@ -179,14 +224,11 @@ static UILabel *VFLabelFromView(UIView *view) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     %init(CopyHooks);
 
+    if (bid.length > 0) {
+        %init(ActivationGestureHooks);
+    }
+
     if ([bid isEqualToString:@"com.apple.springboard"]) {
-        %init(SpringBoardHooks);
-    } else if (bid.length > 0) {
-        int regToken;
-        NSString *notifForBundle = [NSString stringWithFormat:@"com.joshua.volumeflex/%@", bid];
-        notify_register_dispatch(notifForBundle.UTF8String, &regToken, dispatch_get_main_queue(), ^(int token) {
-            dlopen(gFlexDylibPath.UTF8String, RTLD_NOW);
-            [[objc_getClass("FLEXManager") sharedManager] showExplorer];
-        });
+        %init(SpringBoardStatusBarHooks);
     }
 }
