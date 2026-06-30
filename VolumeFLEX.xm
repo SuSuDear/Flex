@@ -229,16 +229,25 @@ static NSString *VFExportCurrentClassInfo(UIViewController *controller, NSError 
         return nil;
     }
 
-    UIPasteboard.generalPasteboard.string = path;
     return path;
 }
 
-static void VFShowExportResult(UIViewController *presenter, NSString *path, NSError *error) {
-    NSString *title = path ? @"Exported TXT" : @"Export Failed";
-    NSString *message = path ? [NSString stringWithFormat:@"Saved to:\n%@\n\nPath copied to pasteboard.", path] : error.localizedDescription;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [presenter presentViewController:alert animated:YES completion:nil];
+static void VFShareExportedFile(UIViewController *presenter, NSString *path, NSError *error) {
+    if (!path) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Export Failed" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [presenter presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    NSURL *fileURL = [NSURL fileURLWithPath:path];
+    UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+    if (activity.popoverPresentationController) {
+        activity.popoverPresentationController.sourceView = presenter.view;
+        activity.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+        activity.popoverPresentationController.permittedArrowDirections = 0;
+    }
+    [presenter presentViewController:activity animated:YES completion:nil];
 }
 
 %group SpringBoardStatusBarHooks
@@ -354,7 +363,7 @@ static void VFShowExportResult(UIViewController *presenter, NSString *path, NSEr
         UIViewController *presenter = explorerController ?: VFTopViewController();
         NSError *error = nil;
         NSString *path = VFExportCurrentClassInfo(explorerController, &error);
-        VFShowExportResult(presenter, path, error);
+        VFShareExportedFile(presenter, path, error);
     }];
 
     objc_setAssociatedObject(self, &kVFExportActionAddedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
