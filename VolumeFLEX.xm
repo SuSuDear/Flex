@@ -444,6 +444,280 @@ static NSString *VFExportCurrentClassInfo(UIViewController *controller, NSError 
     return path;
 }
 
+
+static NSString *VFShellQuote(NSString *value) {
+    return [NSString stringWithFormat:@"'%@'", [value stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+static NSString *VFFrameString(CGRect rect) {
+    return NSStringFromCGRect(rect);
+}
+
+static NSString *VFPointString(CGPoint point) {
+    return NSStringFromCGPoint(point);
+}
+
+static NSString *VFSizeString(CGSize size) {
+    return NSStringFromCGSize(size);
+}
+
+static id VFKVCValue(id object, NSString *key) {
+    if (!object || key.length == 0) {
+        return nil;
+    }
+
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static void VFAppendLine(NSMutableString *output, NSString *key, id value) {
+    NSString *string = VFSafeString(value);
+    if (string.length > 0) {
+        [output appendFormat:@"%@: %@\n", key, string];
+    }
+}
+
+static void VFAppendKVCSection(NSMutableString *output, id object, NSString *title, NSArray<NSString *> *keys) {
+    [output appendFormat:@"\n## %@\n", title];
+    BOOL hasValue = NO;
+    for (NSString *key in keys) {
+        id value = VFKVCValue(object, key);
+        if (value) {
+            hasValue = YES;
+            [output appendFormat:@"%@: %@\n", key, VFSafeString(value)];
+        }
+    }
+    if (!hasValue) {
+        [output appendString:@"(none)\n"];
+    }
+}
+
+static void VFAppendObjectIvars(NSMutableString *output, id object, NSUInteger limit) {
+    if (!object || VFIsClassObject(object)) {
+        return;
+    }
+
+    [output appendString:@"\n## Runtime Ivars\n"];
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(object), &count);
+    if (count == 0) {
+        [output appendString:@"(none)\n"];
+        free(ivars);
+        return;
+    }
+
+    unsigned int cappedCount = (unsigned int)MIN((NSUInteger)count, limit);
+    for (unsigned int index = 0; index < cappedCount; index++) {
+        Ivar ivar = ivars[index];
+        NSString *name = VFCStringToString(ivar_getName(ivar));
+        NSString *encoding = VFCStringToString(ivar_getTypeEncoding(ivar));
+        NSString *value = VFValueForIvar(object, ivar);
+        [output appendFormat:@"- %@\n  encoding: %@\n  offset: %td\n", name, encoding, ivar_getOffset(ivar)];
+        if (value.length > 0) {
+            [output appendFormat:@"  value: %@\n", value];
+        }
+    }
+    if (count > cappedCount) {
+        [output appendFormat:@"... truncated %u ivars\n", count - cappedCount];
+    }
+    free(ivars);
+}
+
+static void VFAppendObjectProperties(NSMutableString *output, id object, NSUInteger limit) {
+    if (!object || VFIsClassObject(object)) {
+        return;
+    }
+
+    [output appendString:@"\n## Runtime Properties\n"];
+    unsigned int count = 0;
+    objc_property_t *properties = class_copyPropertyList(object_getClass(object), &count);
+    if (count == 0) {
+        [output appendString:@"(none)\n"];
+        free(properties);
+        return;
+    }
+
+    unsigned int cappedCount = (unsigned int)MIN((NSUInteger)count, limit);
+    for (unsigned int index = 0; index < cappedCount; index++) {
+        objc_property_t property = properties[index];
+        NSString *name = VFCStringToString(property_getName(property));
+        NSString *attributes = VFCStringToString(property_getAttributes(property));
+        NSString *value = VFValueForProperty(object, property);
+        [output appendFormat:@"- %@\n  attributes: %@\n", name, attributes];
+        if (value.length > 0) {
+            [output appendFormat:@"  value: %@\n", value];
+        }
+    }
+    if (count > cappedCount) {
+        [output appendFormat:@"... truncated %u properties\n", count - cappedCount];
+    }
+    free(properties);
+}
+
+static void VFAppendLayerSnapshot(NSMutableString *output, CALayer *layer) {
+    if (!layer) {
+        return;
+    }
+
+    [output appendString:@"\n## Layer\n"];
+    [output appendFormat:@"class: %@\n", NSStringFromClass(layer.class)];
+    [output appendFormat:@"address: %p\n", layer];
+    [output appendFormat:@"frame: %@\n", VFFrameString(layer.frame)];
+    [output appendFormat:@"bounds: %@\n", VFFrameString(layer.bounds)];
+    [output appendFormat:@"position: %@\n", VFPointString(layer.position)];
+    [output appendFormat:@"anchorPoint: %@\n", VFPointString(layer.anchorPoint)];
+    [output appendFormat:@"opacity: %g\n", layer.opacity];
+    [output appendFormat:@"hidden: %@\n", layer.hidden ? @"YES" : @"NO"];
+    [output appendFormat:@"masksToBounds: %@\n", layer.masksToBounds ? @"YES" : @"NO"];
+    [output appendFormat:@"cornerRadius: %g\n", layer.cornerRadius];
+    [output appendFormat:@"borderWidth: %g\n", layer.borderWidth];
+    [output appendFormat:@"shadowOpacity: %g\n", layer.shadowOpacity];
+    [output appendFormat:@"shadowRadius: %g\n", layer.shadowRadius];
+    [output appendFormat:@"shadowOffset: %@\n", VFSizeString(layer.shadowOffset)];
+    VFAppendLine(output, @"compositingFilter", layer.compositingFilter);
+    VFAppendLine(output, @"filters", layer.filters);
+    VFAppendLine(output, @"backgroundFilters", layer.backgroundFilters);
+    [output appendFormat:@"sublayersCount: %lu\n", (unsigned long)layer.sublayers.count];
+}
+
+static void VFAppendViewSnapshot(NSMutableString *output, UIView *view) {
+    [output appendString:@"\n## UIView\n"];
+    [output appendFormat:@"frame: %@\n", VFFrameString(view.frame)];
+    [output appendFormat:@"bounds: %@\n", VFFrameString(view.bounds)];
+    [output appendFormat:@"center: %@\n", VFPointString(view.center)];
+    [output appendFormat:@"alpha: %g\n", view.alpha];
+    [output appendFormat:@"hidden: %@\n", view.hidden ? @"YES" : @"NO"];
+    [output appendFormat:@"opaque: %@\n", view.opaque ? @"YES" : @"NO"];
+    [output appendFormat:@"clipsToBounds: %@\n", view.clipsToBounds ? @"YES" : @"NO"];
+    [output appendFormat:@"userInteractionEnabled: %@\n", view.userInteractionEnabled ? @"YES" : @"NO"];
+    [output appendFormat:@"contentMode: %ld\n", (long)view.contentMode];
+    VFAppendLine(output, @"backgroundColor", view.backgroundColor);
+    VFAppendLine(output, @"tintColor", view.tintColor);
+    [output appendFormat:@"subviewsCount: %lu\n", (unsigned long)view.subviews.count];
+    VFAppendLayerSnapshot(output, view.layer);
+}
+
+static void VFAppendVisualEffectSnapshot(NSMutableString *output, UIVisualEffectView *view) {
+    [output appendString:@"\n## UIVisualEffectView\n"];
+    VFAppendLine(output, @"effect", view.effect);
+    if (view.effect) {
+        [output appendFormat:@"effectClass: %@\n", NSStringFromClass(view.effect.class)];
+        VFAppendKVCSection(output, view.effect, @"Effect Private Keys", @[@"style", @"_style", @"_settings", @"settings", @"effectSettings", @"_effectSettings"]);
+        VFAppendObjectIvars(output, view.effect, 80);
+    }
+    VFAppendLine(output, @"contentView", view.contentView);
+    VFAppendKVCSection(output, view, @"Visual Effect Private Keys", @[@"_effect", @"_effectConfig", @"_effectSettings", @"_backdropView", @"backdropView", @"_backdropViewSettings", @"_contentView", @"_backgroundView"]);
+}
+
+static NSString *VFFileNameForSnapshotNode(NSUInteger index, NSString *path, id object) {
+    NSString *className = NSStringFromClass([object class]) ?: @"Object";
+    NSString *pathPart = [[path stringByReplacingOccurrencesOfString:@"." withString:@"_"] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    return [NSString stringWithFormat:@"%04lu_%@_%@.txt", (unsigned long)index, pathPart.length ? pathPart : @"root", VFSafeFileName(className)];
+}
+
+static NSString *VFWriteSnapshotNode(id object, NSString *path, NSUInteger depth, NSString *directory, NSMutableArray<NSString *> *indexLines, NSUInteger *counter);
+
+static void VFWriteSnapshotChildren(UIView *view, NSString *path, NSUInteger depth, NSString *directory, NSMutableArray<NSString *> *indexLines, NSUInteger *counter) {
+    if (depth >= 4) {
+        return;
+    }
+
+    NSUInteger childIndex = 0;
+    for (UIView *subview in view.subviews) {
+        if (childIndex >= 50) {
+            [indexLines addObject:[NSString stringWithFormat:@"%@/... truncated subviews: %lu", path, (unsigned long)(view.subviews.count - childIndex)]];
+            break;
+        }
+        NSString *childPath = [NSString stringWithFormat:@"%@.%lu", path, (unsigned long)childIndex];
+        VFWriteSnapshotNode(subview, childPath, depth + 1, directory, indexLines, counter);
+        childIndex++;
+    }
+}
+
+static NSString *VFWriteSnapshotNode(id object, NSString *path, NSUInteger depth, NSString *directory, NSMutableArray<NSString *> *indexLines, NSUInteger *counter) {
+    NSUInteger index = (*counter)++;
+    NSString *fileName = VFFileNameForSnapshotNode(index, path, object);
+    NSString *filePath = [directory stringByAppendingPathComponent:fileName];
+
+    NSMutableString *output = [NSMutableString string];
+    [output appendString:@"# FLEX Object Snapshot Node\n\n"];
+    [output appendFormat:@"path: %@\n", path];
+    [output appendFormat:@"depth: %lu\n", (unsigned long)depth];
+    [output appendFormat:@"class: %@\n", NSStringFromClass([object class])];
+    [output appendFormat:@"address: %p\n", object];
+    [output appendFormat:@"description: %@\n", VFSafeString(object)];
+
+    if ([object isKindOfClass:UIView.class]) {
+        UIView *view = (UIView *)object;
+        VFAppendViewSnapshot(output, view);
+        if ([view isKindOfClass:UIVisualEffectView.class]) {
+            VFAppendVisualEffectSnapshot(output, (UIVisualEffectView *)view);
+        }
+        VFAppendObjectProperties(output, view, 120);
+        VFAppendObjectIvars(output, view, 120);
+        VFWriteSnapshotChildren(view, path, depth, directory, indexLines, counter);
+    } else if ([object isKindOfClass:CALayer.class]) {
+        VFAppendLayerSnapshot(output, (CALayer *)object);
+        VFAppendObjectProperties(output, object, 120);
+        VFAppendObjectIvars(output, object, 120);
+    } else {
+        VFAppendObjectProperties(output, object, 120);
+        VFAppendObjectIvars(output, object, 120);
+    }
+
+    [output writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [indexLines addObject:[NSString stringWithFormat:@"%@ -> %@ (%@ %p)", path, fileName, NSStringFromClass([object class]), object]];
+    return filePath;
+}
+
+static NSString *VFExportObjectSnapshotZIP(UIViewController *controller, NSError **error) {
+    id explorer = VFCall(controller, @selector(explorer));
+    id object = VFCall(explorer, @selector(object)) ?: VFCall(controller, @selector(object));
+    if (!object) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find current object."}];
+        }
+        return nil;
+    }
+
+    NSString *className = NSStringFromClass([object class]) ?: @"Object";
+    NSString *baseDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VolumeFLEXExports"];
+    [NSFileManager.defaultManager createDirectoryAtPath:baseDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *exportName = [NSString stringWithFormat:@"%@-Snapshot-%@", VFSafeFileName(className), @((long long)(NSDate.date.timeIntervalSince1970))];
+    NSString *directory = [baseDirectory stringByAppendingPathComponent:exportName];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:error]) {
+        return nil;
+    }
+
+    NSMutableArray<NSString *> *indexLines = [NSMutableArray array];
+    [indexLines addObject:@"# FLEX Object Snapshot ZIP Index"];
+    [indexLines addObject:[NSString stringWithFormat:@"rootClass: %@", className]];
+    [indexLines addObject:[NSString stringWithFormat:@"rootAddress: %p", object]];
+    [indexLines addObject:[NSString stringWithFormat:@"exportedAt: %@", NSDate.date]];
+    [indexLines addObject:@""];
+
+    NSUInteger counter = 0;
+    VFWriteSnapshotNode(object, @"root", 0, directory, indexLines, &counter);
+    [[indexLines componentsJoinedByString:@"\n"] writeToFile:[directory stringByAppendingPathComponent:@"index.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSString *zipPath = [baseDirectory stringByAppendingPathComponent:[exportName stringByAppendingPathExtension:@"zip"]];
+    [NSFileManager.defaultManager removeItemAtPath:zipPath error:nil];
+    NSString *command = [NSString stringWithFormat:@"cd %@ && /usr/bin/zip -qry %@ %@", VFShellQuote(baseDirectory), VFShellQuote(zipPath), VFShellQuote(exportName)];
+    int result = system(command.UTF8String);
+    if (result != 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create ZIP archive."}];
+        }
+        return nil;
+    }
+
+    return zipPath;
+}
+
 static void VFShareExportedFile(UIViewController *presenter, NSString *path, NSError *error) {
     if (!path) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Export Failed" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
@@ -578,8 +852,18 @@ static void VFShareExportedFile(UIViewController *presenter, NSString *path, NSE
         VFShareExportedFile(presenter, path, error);
     }];
 
+    UIAlertAction *snapshotAction = [UIAlertAction actionWithTitle:@"Export Object Snapshot ZIP" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *selectedAction) {
+        UIAlertController *alert = weakAlert;
+        UIViewController *explorerController = VFObjectExplorerViewControllerForAlert(alert);
+        UIViewController *presenter = explorerController ?: VFTopViewController();
+        NSError *error = nil;
+        NSString *path = VFExportObjectSnapshotZIP(explorerController, &error);
+        VFShareExportedFile(presenter, path, error);
+    }];
+
     objc_setAssociatedObject(self, &kVFExportActionAddedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self addAction:exportAction];
+    [self addAction:snapshotAction];
 }
 
 %end
