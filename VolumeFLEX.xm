@@ -445,8 +445,125 @@ static NSString *VFExportCurrentClassInfo(UIViewController *controller, NSError 
 }
 
 
-static NSString *VFShellQuote(NSString *value) {
-    return [NSString stringWithFormat:@"'%@'", [value stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+static void VFAppendUInt16(NSMutableData *data, uint16_t value) {
+    uint8_t bytes[] = { (uint8_t)(value & 0xff), (uint8_t)((value >> 8) & 0xff) };
+    [data appendBytes:bytes length:sizeof(bytes)];
+}
+
+static void VFAppendUInt32(NSMutableData *data, uint32_t value) {
+    uint8_t bytes[] = {
+        (uint8_t)(value & 0xff),
+        (uint8_t)((value >> 8) & 0xff),
+        (uint8_t)((value >> 16) & 0xff),
+        (uint8_t)((value >> 24) & 0xff)
+    };
+    [data appendBytes:bytes length:sizeof(bytes)];
+}
+
+static uint32_t VFCRC32(NSData *data) {
+    uint32_t crc = 0xffffffff;
+    const uint8_t *bytes = data.bytes;
+    for (NSUInteger index = 0; index < data.length; index++) {
+        crc ^= bytes[index];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ (0xedb88320 & (uint32_t)-(int32_t)(crc & 1));
+        }
+    }
+    return crc ^ 0xffffffff;
+}
+
+static BOOL VFCreateZIPFromDirectory(NSString *directory, NSString *rootName, NSString *zipPath, NSError **error) {
+    NSArray<NSString *> *fileNames = [NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:error];
+    if (!fileNames) {
+        return NO;
+    }
+
+    NSMutableData *zipData = [NSMutableData data];
+    NSMutableData *centralDirectory = [NSMutableData data];
+    NSUInteger entryCount = 0;
+
+    for (NSString *fileName in fileNames) {
+        NSString *filePath = [directory stringByAppendingPathComponent:fileName];
+        BOOL isDirectory = NO;
+        if (![NSFileManager.defaultManager fileExistsAtPath:filePath isDirectory:&isDirectory] || isDirectory) {
+            continue;
+        }
+
+        NSData *fileData = [NSData dataWithContentsOfFile:filePath options:0 error:error];
+        if (!fileData) {
+            return NO;
+        }
+
+        NSString *relativePath = [rootName stringByAppendingPathComponent:fileName];
+        NSData *nameData = [relativePath dataUsingEncoding:NSUTF8StringEncoding];
+        if (!nameData || nameData.length > UINT16_MAX || fileData.length > UINT32_MAX || zipData.length > UINT32_MAX) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:4 userInfo:@{NSLocalizedDescriptionKey: @"ZIP entry is too large."}];
+            }
+            return NO;
+        }
+
+        uint32_t crc = VFCRC32(fileData);
+        uint32_t size = (uint32_t)fileData.length;
+        uint32_t localHeaderOffset = (uint32_t)zipData.length;
+        uint16_t nameLength = (uint16_t)nameData.length;
+
+        VFAppendUInt32(zipData, 0x04034b50);
+        VFAppendUInt16(zipData, 20);
+        VFAppendUInt16(zipData, 0);
+        VFAppendUInt16(zipData, 0);
+        VFAppendUInt16(zipData, 0);
+        VFAppendUInt16(zipData, 0);
+        VFAppendUInt32(zipData, crc);
+        VFAppendUInt32(zipData, size);
+        VFAppendUInt32(zipData, size);
+        VFAppendUInt16(zipData, nameLength);
+        VFAppendUInt16(zipData, 0);
+        [zipData appendData:nameData];
+        [zipData appendData:fileData];
+
+        VFAppendUInt32(centralDirectory, 0x02014b50);
+        VFAppendUInt16(centralDirectory, 20);
+        VFAppendUInt16(centralDirectory, 20);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt32(centralDirectory, crc);
+        VFAppendUInt32(centralDirectory, size);
+        VFAppendUInt32(centralDirectory, size);
+        VFAppendUInt16(centralDirectory, nameLength);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt16(centralDirectory, 0);
+        VFAppendUInt32(centralDirectory, 0);
+        VFAppendUInt32(centralDirectory, localHeaderOffset);
+        [centralDirectory appendData:nameData];
+
+        entryCount++;
+    }
+
+    if (entryCount > UINT16_MAX || centralDirectory.length > UINT32_MAX || zipData.length > UINT32_MAX) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:5 userInfo:@{NSLocalizedDescriptionKey: @"ZIP archive is too large."}];
+        }
+        return NO;
+    }
+
+    uint32_t centralDirectoryOffset = (uint32_t)zipData.length;
+    uint32_t centralDirectorySize = (uint32_t)centralDirectory.length;
+    [zipData appendData:centralDirectory];
+    VFAppendUInt32(zipData, 0x06054b50);
+    VFAppendUInt16(zipData, 0);
+    VFAppendUInt16(zipData, 0);
+    VFAppendUInt16(zipData, (uint16_t)entryCount);
+    VFAppendUInt16(zipData, (uint16_t)entryCount);
+    VFAppendUInt32(zipData, centralDirectorySize);
+    VFAppendUInt32(zipData, centralDirectoryOffset);
+    VFAppendUInt16(zipData, 0);
+
+    return [zipData writeToFile:zipPath options:NSDataWritingAtomic error:error];
 }
 
 static NSString *VFFrameString(CGRect rect) {
@@ -706,12 +823,7 @@ static NSString *VFExportObjectSnapshotZIP(UIViewController *controller, NSError
 
     NSString *zipPath = [baseDirectory stringByAppendingPathComponent:[exportName stringByAppendingPathExtension:@"zip"]];
     [NSFileManager.defaultManager removeItemAtPath:zipPath error:nil];
-    NSString *command = [NSString stringWithFormat:@"cd %@ && /usr/bin/zip -qry %@ %@", VFShellQuote(baseDirectory), VFShellQuote(zipPath), VFShellQuote(exportName)];
-    int result = system(command.UTF8String);
-    if (result != 0) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VolumeFLEXExport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create ZIP archive."}];
-        }
+    if (!VFCreateZIPFromDirectory(directory, exportName, zipPath, error)) {
         return nil;
     }
 
