@@ -1,0 +1,9 @@
+Package: com.joshua.volumeflex
+Name: VolumeFLEX
+Version: 1.0
+Architecture: iphoneos-arm
+Description: The world does not need another FLEX loader but people with fat fingers do.
+Maintainer: Joshua Wheeler
+Author: Joshua Wheeler
+Section: Tweaks
+Depends: mobilesubstrate
