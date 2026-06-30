@@ -152,30 +152,226 @@ static id VFCall(id target, SEL selector) {
 #pragma clang diagnostic pop
 }
 
-static void VFAppendMetadataItems(NSMutableString *output, NSString *title, NSArray *items) {
-    [output appendFormat:@"\n## %@ (%lu)\n", title, (unsigned long)items.count];
+static NSString *VFCStringToString(const char *value) {
+    return value ? [NSString stringWithUTF8String:value] ?: @"" : @"";
+}
 
-    if (items.count == 0) {
+static NSString *VFTypeName(const char *type) {
+    NSString *encoding = VFCStringToString(type);
+    if (encoding.length == 0) {
+        return @"";
+    }
+
+    NSDictionary *knownTypes = @{
+        @"c": @"char / BOOL", @"i": @"int", @"s": @"short", @"l": @"long", @"q": @"long long",
+        @"C": @"unsigned char", @"I": @"unsigned int", @"S": @"unsigned short", @"L": @"unsigned long", @"Q": @"unsigned long long",
+        @"f": @"float", @"d": @"double", @"B": @"bool", @"v": @"void", @"*": @"char *", @"@": @"id",
+        @"#": @"Class", @":": @"SEL"
+    };
+
+    NSString *known = knownTypes[encoding];
+    if (known.length > 0) {
+        return known;
+    }
+
+    if ([encoding hasPrefix:@"@\""] && [encoding hasSuffix:@"\""]) {
+        return [encoding substringWithRange:NSMakeRange(2, encoding.length - 3)];
+    }
+
+    if ([encoding hasPrefix:@"^"]) {
+        return [NSString stringWithFormat:@"pointer to %@", VFTypeName(type + 1)];
+    }
+
+    return encoding;
+}
+
+static NSString *VFImplementationImage(IMP implementation) {
+    if (!implementation) {
+        return @"";
+    }
+
+    Dl_info info;
+    if (dladdr((const void *)implementation, &info) && info.dli_fname) {
+        NSString *image = VFCStringToString(info.dli_fname);
+        NSString *symbol = VFCStringToString(info.dli_sname);
+        if (symbol.length > 0) {
+            return [NSString stringWithFormat:@"%@ (%@)", image, symbol];
+        }
+        return image;
+    }
+
+    return @"";
+}
+
+static BOOL VFIsClassObject(id object) {
+    return object && class_isMetaClass(object_getClass(object));
+}
+
+static NSString *VFValueForProperty(id object, objc_property_t property) {
+    if (!object || VFIsClassObject(object)) {
+        return @"";
+    }
+
+    const char *propertyName = property_getName(property);
+    if (!propertyName) {
+        return @"";
+    }
+
+    NSString *name = VFCStringToString(propertyName);
+    @try {
+        id value = [object valueForKey:name];
+        return VFSafeString(value);
+    } @catch (__unused NSException *exception) {
+        return @"<unavailable>";
+    }
+}
+
+static NSString *VFValueForIvar(id object, Ivar ivar) {
+    if (!object || VFIsClassObject(object)) {
+        return @"";
+    }
+
+    const char *type = ivar_getTypeEncoding(ivar);
+    if (!type || type[0] != '@') {
+        return @"<non-object>";
+    }
+
+    @try {
+        id value = object_getIvar(object, ivar);
+        return VFSafeString(value);
+    } @catch (__unused NSException *exception) {
+        return @"<unavailable>";
+    }
+}
+
+static void VFAppendPropertyList(NSMutableString *output, Class cls, id object, BOOL classProperties) {
+    unsigned int count = 0;
+    Class targetClass = classProperties ? object_getClass(cls) : cls;
+    objc_property_t *properties = class_copyPropertyList(targetClass, &count);
+    [output appendFormat:@"\n### %@ (%u)\n", classProperties ? @"Class Properties" : @"Properties", count];
+
+    if (count == 0) {
         [output appendString:@"(none)\n"];
+        free(properties);
         return;
     }
 
-    for (id item in items) {
-        NSString *name = VFSafeString(VFCall(item, @selector(name)) ?: VFCall(item, @selector(selectorString)));
-        NSString *detail = VFSafeString(
-            VFCall(item, @selector(fullDescription)) ?:
-            VFCall(item, @selector(details)) ?:
-            VFCall(item, @selector(description))
-        );
+    for (unsigned int index = 0; index < count; index++) {
+        objc_property_t property = properties[index];
+        NSString *name = VFCStringToString(property_getName(property));
+        NSString *attributes = VFCStringToString(property_getAttributes(property));
+        NSString *value = classProperties ? @"" : VFValueForProperty(object, property);
 
-        if (name.length > 0 && detail.length > 0 && ![detail isEqualToString:name]) {
-            [output appendFormat:@"%@\n  %@\n", name, detail];
-        } else if (detail.length > 0) {
-            [output appendFormat:@"%@\n", detail];
-        } else if (name.length > 0) {
-            [output appendFormat:@"%@\n", name];
+        [output appendFormat:@"- %@\n", name.length ? name : @"(unknown)"];
+        if (attributes.length > 0) {
+            [output appendFormat:@"  attributes: %@\n", attributes];
+        }
+        if (value.length > 0) {
+            [output appendFormat:@"  value: %@\n", value];
         }
     }
+
+    free(properties);
+}
+
+static void VFAppendIvarList(NSMutableString *output, Class cls, id object) {
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList(cls, &count);
+    [output appendFormat:@"\n### Ivars (%u)\n", count];
+
+    if (count == 0) {
+        [output appendString:@"(none)\n"];
+        free(ivars);
+        return;
+    }
+
+    for (unsigned int index = 0; index < count; index++) {
+        Ivar ivar = ivars[index];
+        const char *type = ivar_getTypeEncoding(ivar);
+        NSString *name = VFCStringToString(ivar_getName(ivar));
+        NSString *encoding = VFCStringToString(type);
+        NSString *value = VFValueForIvar(object, ivar);
+
+        [output appendFormat:@"- %@\n", name.length ? name : @"(unknown)"];
+        [output appendFormat:@"  type: %@\n", VFTypeName(type)];
+        [output appendFormat:@"  encoding: %@\n", encoding];
+        [output appendFormat:@"  offset: %td\n", ivar_getOffset(ivar)];
+        if (value.length > 0) {
+            [output appendFormat:@"  value: %@\n", value];
+        }
+    }
+
+    free(ivars);
+}
+
+static void VFAppendMethodList(NSMutableString *output, Class cls, BOOL classMethods) {
+    unsigned int count = 0;
+    Class targetClass = classMethods ? object_getClass(cls) : cls;
+    Method *methods = class_copyMethodList(targetClass, &count);
+    [output appendFormat:@"\n### %@ (%u)\n", classMethods ? @"Class Methods" : @"Methods", count];
+
+    if (count == 0) {
+        [output appendString:@"(none)\n"];
+        free(methods);
+        return;
+    }
+
+    NSString *className = NSStringFromClass(cls);
+    for (unsigned int index = 0; index < count; index++) {
+        Method method = methods[index];
+        SEL selector = method_getName(method);
+        IMP implementation = method_getImplementation(method);
+        unsigned int argumentCount = method_getNumberOfArguments(method);
+        char *returnType = method_copyReturnType(method);
+        const char *typeEncoding = method_getTypeEncoding(method);
+
+        [output appendFormat:@"- %@[%@ %@]\n", classMethods ? @"+" : @"-", className, NSStringFromSelector(selector)];
+        [output appendFormat:@"  selector: %@\n", NSStringFromSelector(selector)];
+        [output appendFormat:@"  return: %@ (%@)\n", VFTypeName(returnType), VFCStringToString(returnType)];
+        [output appendFormat:@"  arguments: %u\n", argumentCount];
+        for (unsigned int argumentIndex = 0; argumentIndex < argumentCount; argumentIndex++) {
+            char *argumentType = method_copyArgumentType(method, argumentIndex);
+            NSString *argumentName = argumentIndex == 0 ? @"self" : (argumentIndex == 1 ? @"_cmd" : [NSString stringWithFormat:@"arg%u", argumentIndex - 2]);
+            [output appendFormat:@"    %@: %@ (%@)\n", argumentName, VFTypeName(argumentType), VFCStringToString(argumentType)];
+            free(argumentType);
+        }
+        [output appendFormat:@"  typeEncoding: %@\n", VFCStringToString(typeEncoding)];
+        [output appendFormat:@"  imp: %p\n", implementation];
+        NSString *image = VFImplementationImage(implementation);
+        if (image.length > 0) {
+            [output appendFormat:@"  image: %@\n", image];
+        }
+
+        free(returnType);
+    }
+
+    free(methods);
+}
+
+static void VFAppendProtocolList(NSMutableString *output, Class cls) {
+    unsigned int count = 0;
+    Protocol *__unsafe_unretained *protocols = class_copyProtocolList(cls, &count);
+    [output appendFormat:@"\n### Protocols (%u)\n", count];
+
+    if (count == 0) {
+        [output appendString:@"(none)\n"];
+        free(protocols);
+        return;
+    }
+
+    for (unsigned int index = 0; index < count; index++) {
+        [output appendFormat:@"- %@\n", VFCStringToString(protocol_getName(protocols[index]))];
+    }
+
+    free(protocols);
+}
+
+static NSArray<Class> *VFClassHierarchy(Class cls) {
+    NSMutableArray<Class> *classes = [NSMutableArray array];
+    for (Class candidate = cls; candidate; candidate = class_getSuperclass(candidate)) {
+        [classes addObject:candidate];
+    }
+    return classes;
 }
 
 static NSString *VFSafeFileName(NSString *name) {
@@ -196,34 +392,50 @@ static NSString *VFExportCurrentClassInfo(UIViewController *controller, NSError 
     }
 
     id object = VFCall(explorer, @selector(object)) ?: VFCall(controller, @selector(object));
-    NSString *objectName = NSStringFromClass(object_getClass(object));
-    if (object && object == object_getClass(object)) {
-        objectName = NSStringFromClass((Class)object);
-    }
+    Class cls = VFIsClassObject(object) ? (Class)object : object_getClass(object);
+    NSString *className = NSStringFromClass(cls);
+    NSString *originalClassName = [className hasPrefix:@"NSKVONotifying_"] ? [className substringFromIndex:@"NSKVONotifying_".length] : @"";
 
     NSMutableString *output = [NSMutableString string];
-    [output appendFormat:@"FLEX Class Export\n"];
+    [output appendString:@"# FLEX Enhanced Class Export\n\n"];
     [output appendFormat:@"Object: %@\n", VFSafeString(object)];
-    [output appendFormat:@"Class: %@\n", objectName ?: @"(unknown)"];
+    [output appendFormat:@"Object Address: %p\n", object];
+    [output appendFormat:@"Class: %@\n", className ?: @"(unknown)"];
+    if (originalClassName.length > 0) {
+        [output appendFormat:@"KVO Original Class: %@\n", originalClassName];
+    }
+    [output appendFormat:@"Superclass: %@\n", NSStringFromClass(class_getSuperclass(cls)) ?: @"(none)"];
+    [output appendFormat:@"Metaclass: %@\n", NSStringFromClass(object_getClass(cls)) ?: @"(unknown)"];
+    [output appendFormat:@"Instance Size: %zu\n", class_getInstanceSize(cls)];
     [output appendFormat:@"Exported At: %@\n", NSDate.date];
 
-    NSString *objectDescription = VFSafeString(VFCall(explorer, @selector(objectDescription)));
+    NSString *objectDescription = VFSafeString(VFCall(explorer, @selector(objectDescription)) ?: object);
     if (objectDescription.length > 0) {
         [output appendFormat:@"\n## Description\n%@\n", objectDescription];
     }
 
-    VFAppendMetadataItems(output, @"Properties", VFCall(explorer, @selector(properties)) ?: @[]);
-    VFAppendMetadataItems(output, @"Class Properties", VFCall(explorer, @selector(classProperties)) ?: @[]);
-    VFAppendMetadataItems(output, @"Ivars", VFCall(explorer, @selector(ivars)) ?: @[]);
-    VFAppendMetadataItems(output, @"Methods", VFCall(explorer, @selector(methods)) ?: @[]);
-    VFAppendMetadataItems(output, @"Class Methods", VFCall(explorer, @selector(classMethods)) ?: @[]);
-    VFAppendMetadataItems(output, @"Protocols", VFCall(explorer, @selector(conformedProtocols)) ?: @[]);
-    VFAppendMetadataItems(output, @"Class Hierarchy", VFCall(explorer, @selector(classHierarchy)) ?: @[]);
+    NSArray<Class> *hierarchy = VFClassHierarchy(cls);
+    [output appendString:@"\n## Class Hierarchy\n"];
+    for (Class hierarchyClass in hierarchy) {
+        [output appendFormat:@"- %@\n", NSStringFromClass(hierarchyClass)];
+    }
+
+    for (Class hierarchyClass in hierarchy) {
+        [output appendFormat:@"\n\n## %@\n", NSStringFromClass(hierarchyClass)];
+        [output appendFormat:@"Superclass: %@\n", NSStringFromClass(class_getSuperclass(hierarchyClass)) ?: @"(none)"];
+        [output appendFormat:@"Instance Size: %zu\n", class_getInstanceSize(hierarchyClass)];
+        VFAppendPropertyList(output, hierarchyClass, object, NO);
+        VFAppendPropertyList(output, hierarchyClass, object, YES);
+        VFAppendIvarList(output, hierarchyClass, object);
+        VFAppendMethodList(output, hierarchyClass, NO);
+        VFAppendMethodList(output, hierarchyClass, YES);
+        VFAppendProtocolList(output, hierarchyClass);
+    }
 
     NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VolumeFLEXExports"];
     [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
 
-    NSString *fileName = [NSString stringWithFormat:@"%@-%@.txt", VFSafeFileName(objectName), @((long long)(NSDate.date.timeIntervalSince1970))];
+    NSString *fileName = [NSString stringWithFormat:@"%@-%@.txt", VFSafeFileName(className), @((long long)(NSDate.date.timeIntervalSince1970))];
     NSString *path = [directory stringByAppendingPathComponent:fileName];
     if (![output writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error]) {
         return nil;
