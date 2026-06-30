@@ -462,7 +462,7 @@ static void VFAppendUInt32(NSMutableData *data, uint32_t value) {
 
 static uint32_t VFCRC32(NSData *data) {
     uint32_t crc = 0xffffffff;
-    const uint8_t *bytes = data.bytes;
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
     for (NSUInteger index = 0; index < data.length; index++) {
         crc ^= bytes[index];
         for (int bit = 0; bit < 8; bit++) {
